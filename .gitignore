@@ -1,0 +1,7 @@
+td_data/
+.env
+__pycache__/
+*.pyc
+tg-backup-*.json
+tg-backup-*/
+tg-backup.log
