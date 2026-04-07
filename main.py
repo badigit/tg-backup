@@ -161,12 +161,13 @@ async def fetch_private_info(ct, contact_ids):
     entry["is_premium"] = getattr(user, "is_premium", False)
     entry["last_seen"] = get_last_seen(user)
 
-    user_full = await client.getUserFullInfo(user_id=ct.user_id)
-    if not isinstance(user_full, types.Error):
-        bio = getattr(user_full, "bio", None)
-        if bio:
-            entry["bio"] = bio.text if hasattr(bio, "text") else str(bio)
-        entry["birthdate"] = get_birthdate(user_full)
+    if ARGS.full:
+        user_full = await client.getUserFullInfo(user_id=ct.user_id)
+        if not isinstance(user_full, types.Error):
+            bio = getattr(user_full, "bio", None)
+            if bio:
+                entry["bio"] = bio.text if hasattr(bio, "text") else str(bio)
+            entry["birthdate"] = get_birthdate(user_full)
 
     entry["is_contact"] = ct.user_id in contact_ids
     return entry
@@ -313,12 +314,13 @@ async def _do_export():
     all_chat_ids = []
     for chat_list in [types.ChatListMain(), types.ChatListArchive()]:
         while True:
-            result = await client.getChats(chat_list=chat_list, limit=100)
-            if isinstance(result, types.Error) or not result.chat_ids:
-                break
+            result = await client.loadChats(chat_list=chat_list, limit=100)
+            if isinstance(result, types.Error):
+                break  # 404 = all chats loaded
+        result = await client.getChats(chat_list=chat_list, limit=999999)
+        if not isinstance(result, types.Error) and result.chat_ids:
             all_chat_ids.extend(result.chat_ids)
-            if len(result.chat_ids) < 100:
-                break
+            log.info("  %s: %d chats", chat_list.__class__.__name__, len(result.chat_ids))
 
     # Deduplicate
     seen = set()
@@ -401,12 +403,81 @@ async def _do_export():
             "phone": me.phone_number or None,
             "is_premium": getattr(me, "is_premium", False),
         }
-        me_full = await client.getUserFullInfo(user_id=me.id)
-        if not isinstance(me_full, types.Error):
-            bio = getattr(me_full, "bio", None)
-            if bio:
-                my_profile["bio"] = bio.text if hasattr(bio, "text") else str(bio)
-            my_profile["birthdate"] = get_birthdate(me_full)
+        if ARGS.full:
+            me_full = await client.getUserFullInfo(user_id=me.id)
+            if not isinstance(me_full, types.Error):
+                bio = getattr(me_full, "bio", None)
+                if bio:
+                    my_profile["bio"] = bio.text if hasattr(bio, "text") else str(bio)
+                my_profile["birthdate"] = get_birthdate(me_full)
+
+    # Blocked users
+    log.info("Fetching blocked users...")
+    blocked = []
+    offset = 0
+    while True:
+        result = await client.getBlockedMessageSenders(
+            block_list=types.BlockListMain(), offset=offset, limit=100)
+        if isinstance(result, types.Error) or not result.senders:
+            break
+        for sender in result.senders:
+            ms = sender.sender
+            if isinstance(ms, types.MessageSenderUser):
+                user = await client.getUser(user_id=ms.user_id)
+                if not isinstance(user, types.Error):
+                    blocked.append({
+                        "id": ms.user_id,
+                        "name": f"{user.first_name or ''} {user.last_name or ''}".strip(),
+                        "username": get_username(user),
+                    })
+                else:
+                    blocked.append({"id": ms.user_id})
+            elif isinstance(ms, types.MessageSenderChat):
+                blocked.append({"id": ms.chat_id, "type": "chat"})
+        offset += len(result.senders)
+        if len(result.senders) < 100:
+            break
+    log.info("  blocked: %d", len(blocked))
+
+    # Active sessions
+    log.info("Fetching active sessions...")
+    sessions = []
+    result = await client.getActiveSessions()
+    if not isinstance(result, types.Error):
+        for s in result.sessions:
+            sessions.append({
+                "id": s.id,
+                "is_current": s.is_current,
+                "device_model": s.device_model,
+                "platform": s.platform,
+                "system_version": s.system_version,
+                "application_name": s.application_name,
+                "application_version": s.application_version,
+                "log_in_date": datetime.fromtimestamp(s.log_in_date, tz=timezone.utc).isoformat() if s.log_in_date else None,
+                "last_active_date": datetime.fromtimestamp(s.last_active_date, tz=timezone.utc).isoformat() if s.last_active_date else None,
+                "ip_address": s.ip_address,
+                "location": s.location,
+            })
+    log.info("  sessions: %d", len(sessions))
+
+    # Connected websites
+    log.info("Fetching connected websites...")
+    websites = []
+    result = await client.getConnectedWebsites()
+    if not isinstance(result, types.Error):
+        for w in result.websites:
+            websites.append({
+                "id": w.id,
+                "domain_name": w.domain_name,
+                "bot_user_id": w.bot_user_id,
+                "browser": w.browser,
+                "platform": w.platform,
+                "log_in_date": datetime.fromtimestamp(w.log_in_date, tz=timezone.utc).isoformat() if w.log_in_date else None,
+                "last_active_date": datetime.fromtimestamp(w.last_active_date, tz=timezone.utc).isoformat() if w.last_active_date else None,
+                "ip_address": w.ip_address,
+                "location": w.location,
+            })
+    log.info("  websites: %d", len(websites))
 
     # Write output
     now = datetime.now(timezone.utc)
@@ -416,12 +487,21 @@ async def _do_export():
         "my_profile": my_profile,
         "dialogs_count": len(dialogs),
         "extra_contacts_count": len(contacts),
+        "blocked_count": len(blocked),
+        "sessions_count": len(sessions),
+        "websites_count": len(websites),
+    }
+
+    security = {
+        "blocked": blocked,
+        "sessions": sessions,
+        "connected_websites": websites,
     }
 
     if ARGS.single_file:
-        _write_single(now, meta, dialogs, contacts)
+        _write_single(now, meta, dialogs, contacts, security)
     else:
-        _write_split(now, meta, dialogs, contacts)
+        _write_split(now, meta, dialogs, contacts, security)
 
 
 def _dump(path, data):
@@ -437,12 +517,13 @@ def _export_name(now):
     return f"tg-backup-{ARGS.profile}-{date}"
 
 
-def _write_single(now, meta, dialogs, contacts):
+def _write_single(now, meta, dialogs, contacts, security):
     output = {
         **meta,
         "folders": {str(fid): fdata["name"] for fid, fdata in folders_data.items()},
         "dialogs": dialogs,
         "contacts_not_in_dialogs": contacts,
+        **security,
     }
     filename = os.path.join(ARGS.output_dir, f"{_export_name(now)}.json")
     _dump(filename, output)
@@ -450,7 +531,7 @@ def _write_single(now, meta, dialogs, contacts):
              len(dialogs), len(contacts), filename)
 
 
-def _write_split(now, meta, dialogs, contacts):
+def _write_split(now, meta, dialogs, contacts, security):
     outdir = os.path.join(ARGS.output_dir, _export_name(now))
     os.makedirs(outdir, exist_ok=True)
 
@@ -477,6 +558,11 @@ def _write_split(now, meta, dialogs, contacts):
 
     _dump(os.path.join(outdir, "contacts.json"), contacts)
     log.info("  contacts.json: %d", len(contacts))
+
+    _dump(os.path.join(outdir, "security.json"), security)
+    log.info("  security.json: %d blocked, %d sessions, %d websites",
+             len(security["blocked"]), len(security["sessions"]),
+             len(security["connected_websites"]))
     log.info("=== Done! Exported to %s/ ===", outdir)
 
 
